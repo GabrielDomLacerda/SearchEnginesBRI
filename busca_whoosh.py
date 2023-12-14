@@ -4,9 +4,11 @@ from whoosh import index
 from whoosh.index import create_in
 from whoosh.qparser import MultifieldParser, OrGroup, FuzzyTermPlugin, QueryParser
 import os.path
+import shutil
 import re
 import timeit
 import matplotlib.pyplot as plt
+import numpy as np
 
 schema = Schema(index=ID(stored=True),
                 title=TEXT(stored=True),
@@ -87,82 +89,62 @@ def search_results(parser, queries: list[Query], limits: list[int]):
     return results_dict
 
 
-def precision_at_k(search, relevant, k=None):
-    if k is None or k > len(search) or k > len(relevant):
-        k = min(len(search), len(relevant))
-
-    search = search[:k]
-    relevant = relevant[:k]
-
-    search_indexes = set(map(lambda x: x[0], search))
-    relevant_indexes = set(map(lambda x: x[0], relevant))
-
-    den = len(relevant_indexes)
-    num = len(relevant_indexes.intersection(search_indexes))
-
-    if den != 0:
-        return num / den
-
-    return None
+def precision_at_k(answer, relevant, k=None):
+    if k is None or k > len(answer) or k > len(relevant):
+        k = min(len(answer), len(relevant))
+    result = len(set(answer[:k]) & set(relevant)) / k if k != 0 else 0
+    return result
 
 
-def recall_at_k(search, relevant, k=None):
-    if k is None or k > len(search) or k > len(relevant):
-        k = min(len(search), len(relevant))
+def recall_at_k(answer, relevant, k=None):
+    if k is None or k > len(answer) or k > len(relevant):
+        k = min(len(answer), len(relevant))
 
-    search = search[:k]
-    relevant = relevant[:k]
-
-    search_indexes = set(map(lambda x: x[0], search))
-    relevant_indexes = set(map(lambda x: x[0], relevant))
-
-    den = len(relevant)
-    num = len(relevant_indexes.intersection(search_indexes))
-
-    if den != 0:
-        return num / den
-
-    return None
+    d = len(relevant)
+    return len(set(answer[:k]) & set(relevant)) / d if d != 0 else 0
 
 
-def all_results_by_func(search_results_dict,
-                        revelant_results_dict,
+def all_results_by_func(answer_results_dict: dict,
+                        relevant_results_dict: dict,
                         func,
-                        k=None):
-    results = list(
-        map(
-            lambda x: func(search_results_dict[x], revelant_results_dict[x], k
-                           ), range(len(revelant_results_dict))))
+                        k: int = None):
+    size = len(relevant_results_dict)
+    results = np.zeros(size)
+    for i, (answer, relevant) in enumerate(
+            zip(answer_results_dict.values(), relevant_results_dict.values())):
+        answer = list(map(lambda x: x[0], answer))
+        relevant = list(map(lambda x: x[0], relevant))
+        results[i] = func(answer, relevant, k)
     return results
 
 
-def plot_results(search_results_dict,
-                 revelant_results_dict,
-                 func,
-                 title: str = '',
-                 k_s=[1, 5, 10, None]):
-    fig, axis = plt.subplots(len(k_s))
-    fig.suptitle(title)
-    for i, k in enumerate(k_s):
-        r = all_results_by_func(search_results_dict,
-                                revelant_results_dict,
-                                func,
-                                k=k)
-        axis[i].plot(range(len(r)), r)
-        k_name = f'{k}' if k is not None else 'MAX'
-        axis[i].set_title(f'{func.__name__}={k_name}')
-    plt.subplots_adjust(hspace=0.8)
+def plot_results(
+        answer_results_dict,
+        relevant_results_dict,
+        func,
+        k_s=range(1, 10 + 1),
+        title: str = '',
+):
+    results = list(
+        map(
+            lambda k: all_results_by_func(
+                answer_results_dict, relevant_results_dict, func, k).mean(),
+            k_s))
+    plt.plot(k_s, results, marker='o')
+    plt.xlabel('K')
+    plt.ylabel(f'{func.__name__} mean')
+    plt.title(title)
     plt.show()
 
 
-#OBTENDO PALAVRAS
+#OBTENDO QUERIES
 queries = parse_queries('cran/cran.qry')
 
-#OBTENDO QUERIES
+#OBTENDO PALAVRAS
 words = parse_text('cran/cran.all.1400')
 
 #OBTENDO BUSCAS RELEVANTES
-query_relations = get_ordered_relevant_searches('cran/cranqrel')
+relevant_dict = get_ordered_relevant_searches('cran/cranqrel')
 
 #INDEXANDO RESULTADOS
 t0 = timeit.default_timer()
@@ -186,46 +168,57 @@ else:
     writer.commit()
 
 t1 = timeit.default_timer()
-print(f'TEMPO DE INDEXAÇÃO {(t1 - t0):.2f}s')
+print(f'TEMPO DE INDEXAÇÃO = {(t1 - t0):.2f}s')
 
-limits = list(map(lambda x: len(x), query_relations.values()))
+limits = list(map(lambda x: len(x), relevant_dict.values()))
 
+#BUSCA 1: TITULO, AUTOR E CORPO
 parser = MultifieldParser(fieldnames=["title", "author", "body"],
                           schema=schema,
                           group=OrGroup)
 parser.add_plugin(FuzzyTermPlugin())
 
-#BUSCA 1: TITULO, AUTOR E CORPO
 t0 = timeit.default_timer()
-results_dict = search_results(parser, queries, limits)
+results_1 = search_results(parser, queries, limits)
 t1 = timeit.default_timer()
-print(f'TEMPO DA BUSCA 1 {(t1 - t0):.2f}s')
+print(f'TEMPO DA BUSCA 1 = {(t1 - t0):.2f}s')
 
-k_s = [1, 5, 10, None]
-
-#CALCULANDO TODAS AS PRECISIONS PARA BUSCA 1
-plot_results(results_dict, query_relations, precision_at_k,
-             'Cálculo das precisions para busca 1', k_s)
-
-#CALCULANDO TODAS OS RECALLS PARA BUSCA 1
-plot_results(results_dict, query_relations, recall_at_k,
-             'Cálculo dos recalls para busca 1', k_s)
-
+#BUSCA 2: SOMENTE CORPO
 parser_query = QueryParser("body", schema=schema, group=OrGroup)
 parser_query.add_plugin(FuzzyTermPlugin())
 
-#BUSCA 2: SOMENTE CORPO
 t0 = timeit.default_timer()
-results_dict_qp = search_results(parser_query, queries, limits)
+results_2 = search_results(parser_query, queries, limits)
 t1 = timeit.default_timer()
-print(f'TEMPO DA BUSCA 2 {(t1 - t0):.2f}s')
+print(f'TEMPO DA BUSCA 2 = {(t1 - t0):.2f}s')
 
-#CALCULANDO TODAS AS PRECISIONS PARA BUSCA 2
-plot_results(results_dict_qp, query_relations, precision_at_k,
-             'Cálculo das precisions para busca 2', k_s)
+#PLOTANDO GRAFICO DE PRECISION DA BUSCA 1
+plot_results(results_1,
+             relevant_dict,
+             precision_at_k,
+             k_s=range(1, 41),
+             title='Média de Precision@k da busca 1 x k (Whoosh)')
 
-#CALCULANDO TODAS OS RECALLS PARA BUSCA 2
-plot_results(results_dict_qp, query_relations, recall_at_k,
-             'Cálculo dos recalls para busca 2', k_s)
+#PLOTANDO GRAFICO DE RECALL DA BUSCA 1
+plot_results(results_1,
+             relevant_dict,
+             recall_at_k,
+             k_s=range(1, 41),
+             title='Média de Recall@k da busca 1 x k (Whoosh)')
+
+#PLOTANDO GRAFICO DE PRECISION DA BUSCA 2
+plot_results(results_2,
+             relevant_dict,
+             precision_at_k,
+             k_s=range(1, 41),
+             title='Média de Precision@k da busca 2 x k (Whoosh)')
+
+#PLOTANDO GRAFICO DE RECALL DA BUSCA 2]
+plot_results(results_2,
+             relevant_dict,
+             recall_at_k,
+             k_s=range(1, 41),
+             title='Média de Recall@k da busca 2 x k (Whoosh)')
 
 ix.close()
+shutil.rmtree(INDEX_DIRECTORY)
