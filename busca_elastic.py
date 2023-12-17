@@ -1,26 +1,20 @@
-from whoosh.fields import Schema, ID, TEXT
-from whoosh.analysis import StandardAnalyzer
-from whoosh import index
-from whoosh.index import create_in, FileIndex
-from whoosh.qparser import MultifieldParser, OrGroup, FuzzyTermPlugin, QueryParser
-import os.path
-import shutil
+from dotenv import dotenv_values
+from elasticsearch import Elasticsearch
+from elasticsearch.helpers import bulk
 import re
 import timeit
 import matplotlib.pyplot as plt
 import numpy as np
+import time
 
-schema = Schema(index=ID(stored=True),
-                title=TEXT(stored=True),
-                author=TEXT(stored=True),
-                bibliography=TEXT(stored=True),
-                body=TEXT(analyzer=StandardAnalyzer(stoplist=None)))
+INDEX_NAME = 'cran'
 
-INDEX_DIRECTORY = "index_dir"
-if not os.path.exists(INDEX_DIRECTORY):
-    os.mkdir(INDEX_DIRECTORY)
-ix = create_in(INDEX_DIRECTORY, schema)
-ix = index.open_dir(INDEX_DIRECTORY)
+config = dotenv_values('.env')
+es_client = Elasticsearch(
+    config['elasticsearch_uri'],
+    ca_certs=config['ca_certificate'],
+    basic_auth=(config['account'], config['password']),
+)
 
 
 class Text:
@@ -28,6 +22,19 @@ class Text:
     def __init__(self, original):
         result = re.split(r'.T|.A|.B|.W', original.replace('\n', ' '))
         self.index, self.title, self.author, self.bibliography, self.body, *_ = result
+
+    def source_dict(self):
+        source = self.__dict__.copy()
+        source.pop('index')
+        return source
+
+    def to_index_dict(self, index_name):
+        return {
+            '_op_type': 'index',
+            '_index': index_name,
+            '_id': int(self.index),
+            '_source': self.source_dict()
+        }
 
 
 class Query:
@@ -56,6 +63,11 @@ def parse_text(filename):
     return words
 
 
+def parse_to_bulk(filename, index_name):
+    return list(
+        map(lambda x: x.to_index_dict(index_name), parse_text(filename)))
+
+
 def get_ordered_relevant_searches(filename):
     query_relations = {}
     with open(filename, 'r') as file:
@@ -78,22 +90,47 @@ def get_ordered_relevant_searches(filename):
     return query_relations
 
 
-def search_results(parser, queries: list[Query], limits: list[int],
-                   index: FileIndex):
+def search_results(index_name, client: Elasticsearch, queries: list[Query],
+                   limits: list[int], fields: list[str]):
     results_dict = {}
-    with index.searcher() as searcher:
-        for i, (limit, query_to_parse) in enumerate(zip(limits, queries)):
-            query = parser.parse(query_to_parse.body)
-            results = searcher.search(query, limit=max(limit, 10))
-            results_dict[i] = list(
-                map(lambda x: (int(x.get('index')), x.score), results))
+    for i, (limit, query) in enumerate(zip(limits, queries)):
+        body = {
+            'query': {
+                "multi_match": {
+                    "query": query.body,
+                    "fields": fields
+                }
+            },
+            'size': max(limit, 10)
+        }
+        response = client.search(index=index_name, body=body)
+        results_dict[i] = list(
+            map((lambda x: (int(x['_id']), x['_score'])),
+                response['hits']['hits']))
+    return results_dict
+
+
+def search_results_one_field(index_name, client: Elasticsearch,
+                             queries: list[Query], limits: list[int],
+                             field: str):
+    results_dict = {}
+    for i, (limit, query) in enumerate(zip(limits, queries)):
+        response = client.search(index=index_name,
+                                 size=max(limit, 10),
+                                 query={
+                                     "match": {
+                                         field: query.body,
+                                     },
+                                 })
+        results_dict[i] = list(
+            map((lambda x: (int(x['_id']), x['_score'])),
+                response['hits']['hits']))
     return results_dict
 
 
 def precision_at_k(answer, relevant, k=None):
     if k is None or k > len(answer) or k > len(relevant):
         k = min(len(answer), len(relevant))
-
     result = len(set(answer[:k]) & set(relevant)) / k if k != 0 else 0
     return result
 
@@ -143,84 +180,75 @@ def plot_results(
 queries = parse_queries('cran/cran.qry')
 
 #OBTENDO PALAVRAS
-words = parse_text('cran/cran.all.1400')
+words = parse_to_bulk('cran/cran.all.1400', INDEX_NAME)
 
 #OBTENDO BUSCAS RELEVANTES
 relevant_dict = get_ordered_relevant_searches('cran/cranqrel')
 
-#INDEXANDO DOCUMENTOS
+# METODO MUITO LENTO (~2m20s), PREFERIVEL USAR O BULK (~1.3s)
+# t0 = timeit.default_timer()
+# words = parse_text('cran/cran.all.1400')
+# for word in tqdm(words2):
+#     es_client.index(index=INDEX_NAME, id=int(word.index), body=word.source_dict())
+# es_client.indices.delete(index=INDEX_NAME)
+# t1 = timeit.default_timer()
+# print(t1 - t0)
+
+#INDEXANDO RESULTADOS
 t0 = timeit.default_timer()
-writer = ix.writer()
-error = False
-
-for word in words:
-    try:
-        writer.add_document(index=f'{word.index}',
-                            title=word.title,
-                            author=word.author,
-                            bibliography=word.bibliography,
-                            body=word.body)
-    except ValueError:
-        error = True
-        break
-
-if error:
-    writer.cancel()
-else:
-    writer.commit()
-
+es_client.indices.create(index=INDEX_NAME)
+bulk(client=es_client, actions=words)
+while int(
+        es_client.cat.indices(index=INDEX_NAME,
+                              format='json')[0]['docs.count']) != len(words):
+    time.sleep(0.2)
 t1 = timeit.default_timer()
-print(f'TEMPO DE INDEXAÇÃO WHOOSH = {(t1 - t0):.2f}s')
+print(f'TEMPO DE INDEXAÇÃO ELASTICSEARCH = {(t1 - t0):.2f}s')
 
 limits = list(map(lambda x: len(x), relevant_dict.values()))
 
 #BUSCA 1: TITULO, AUTOR E CORPO
-parser = MultifieldParser(fieldnames=["title", "author", "body"],
-                          schema=schema,
-                          group=OrGroup)
-parser.add_plugin(FuzzyTermPlugin())
-
 t0 = timeit.default_timer()
-results_1 = search_results(parser, queries, limits, ix)
+results_1 = search_results(INDEX_NAME, es_client, queries, limits,
+                           ["title", "author", "body"])
 t1 = timeit.default_timer()
-print(f'TEMPO DA BUSCA 1 WHOOSH = {(t1 - t0):.2f}s')
+print(f'TEMPO DA BUSCA 1 ELASTICSEARCH = {(t1 - t0):.2f}s')
 
 #BUSCA 2: SOMENTE CORPO
-parser_query = QueryParser("body", schema=schema, group=OrGroup)
-parser_query.add_plugin(FuzzyTermPlugin())
-
 t0 = timeit.default_timer()
-results_2 = search_results(parser_query, queries, limits, ix)
+results_2 = search_results_one_field(INDEX_NAME, es_client, queries, limits,
+                                     "body")
 t1 = timeit.default_timer()
-print(f'TEMPO DA BUSCA 2 WHOOSH = {(t1 - t0):.2f}s')
+print(f'TEMPO DA BUSCA 1 ELASTICSEARCH = {(t1 - t0):.2f}s')
+
+K_S = range(1, 11)
 
 #PLOTANDO GRAFICO DE PRECISION DA BUSCA 1
 plot_results(results_1,
              relevant_dict,
              precision_at_k,
-             k_s=range(1, 41),
-             title='Média de Precision@k da busca 1 x k (Whoosh)')
+             k_s=K_S,
+             title='Média de Precision@k da busca 1 x k (Elasticsearch)')
 
 #PLOTANDO GRAFICO DE RECALL DA BUSCA 1
 plot_results(results_1,
              relevant_dict,
              recall_at_k,
-             k_s=range(1, 41),
-             title='Média de Recall@k da busca 1 x k (Whoosh)')
+             k_s=K_S,
+             title='Média de Recall@k da busca 1 x k (Elasticsearch)')
 
 #PLOTANDO GRAFICO DE PRECISION DA BUSCA 2
 plot_results(results_2,
              relevant_dict,
              precision_at_k,
-             k_s=range(1, 41),
-             title='Média de Precision@k da busca 2 x k (Whoosh)')
+             k_s=K_S,
+             title='Média de Precision@k da busca 2 x k (Elasticsearch)')
 
 #PLOTANDO GRAFICO DE RECALL DA BUSCA 2
 plot_results(results_2,
              relevant_dict,
              recall_at_k,
-             k_s=range(1, 41),
-             title='Média de Recall@k da busca 2 x k (Whoosh)')
+             k_s=K_S,
+             title='Média de Recall@k da busca 2 x k (Elasticsearch)')
 
-ix.close()
-shutil.rmtree(INDEX_DIRECTORY)
+es_client.indices.delete(index=INDEX_NAME)
